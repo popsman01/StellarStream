@@ -852,3 +852,84 @@ fn test_geometric_rate_unlock_math() {
     v2_client.withdraw(&sid, &receiver);
     assert_eq!(token_client.balance(&receiver), 100_000_000);
 }
+
+// ── top_up tests ─────────────────────────────────────────────────────────────
+
+fn make_stream(env: &Env) -> (ContractClient, Address, Address, u64) {
+    env.mock_all_auths();
+    let admin = Address::generate(env);
+    let sender = Address::generate(env);
+    let receiver = Address::generate(env);
+
+    let contract_id = env.register(Contract, ());
+    let client = ContractClient::new(env, &contract_id);
+    client.init(&admin);
+
+    let (token_addr, _, asset_admin) = create_token(env, &admin);
+    asset_admin.mint(&sender, &400_000_000);
+
+    env.ledger().with_mut(|li| li.timestamp = 100);
+
+    let stream_id = client.create_stream(&StreamArgs {
+        sender: sender.clone(),
+        receiver: receiver.clone(),
+        token: token_addr,
+        total_amount: 100_000_000,
+        start_time: 100,
+        cliff_time: 100,
+        end_time: 200,
+        step_duration: 0,
+        multiplier_bps: 0,
+    });
+
+    (client, sender, receiver, stream_id)
+}
+
+#[test]
+fn test_top_up_extends_end_time() {
+    let env = Env::default();
+    let (client, sender, _, stream_id) = make_stream(&env);
+
+    // At t=150 (halfway through 100..200), top up with 100_000_000 more.
+    env.ledger().with_mut(|li| li.timestamp = 150);
+    client.top_up(&stream_id, &sender, &100_000_000);
+
+    let stream = client.get_stream(&stream_id).unwrap();
+    assert_eq!(stream.total_amount, 200_000_000);
+    // unlocked_at_150 = 100_000_000 * 50/100 = 50_000_000
+    // remaining = 50_000_000 + 100_000_000 (extra) = 150_000_000
+    // extra_seconds = 150_000_000 * 100 / 100_000_000 = 150
+    // new_end_time = 150 + 150 = 300
+    assert_eq!(stream.end_time, 300);
+}
+
+#[test]
+fn test_top_up_only_sender_allowed() {
+    let env = Env::default();
+    let (client, _, receiver, stream_id) = make_stream(&env);
+
+    env.ledger().with_mut(|li| li.timestamp = 110);
+    let result = client.try_top_up(&stream_id, &receiver, &500);
+    assert_eq!(result, Err(Ok(ContractError::NotStreamOwner)));
+}
+
+#[test]
+fn test_top_up_cancelled_stream_fails() {
+    let env = Env::default();
+    let (client, sender, _, stream_id) = make_stream(&env);
+
+    env.ledger().with_mut(|li| li.timestamp = 110);
+    client.cancel(&stream_id, &sender);
+
+    let result = client.try_top_up(&stream_id, &sender, &500);
+    assert_eq!(result, Err(Ok(ContractError::AlreadyCancelled)));
+}
+
+#[test]
+fn test_top_up_nonexistent_stream_fails() {
+    let env = Env::default();
+    let (client, sender, _, _) = make_stream(&env);
+
+    let result = client.try_top_up(&9999u64, &sender, &500);
+    assert_eq!(result, Err(Ok(ContractError::StreamNotFound)));
+}
