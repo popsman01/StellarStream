@@ -1,0 +1,360 @@
+#![no_std]
+#![allow(clippy::too_many_arguments)]
+use soroban_sdk::xdr::ToXdr;
+use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, Vec};
+
+mod errors;
+mod storage;
+mod types;
+mod v1_interface;
+
+use errors::ContractError;
+use types::{
+    ContractPausedEvent, ContractUnpausedEvent, PermitStreamCreatedEvent, StreamMigratedEvent,
+    StreamV2,
+};
+use v1_interface::Client as V1Client;
+
+#[contract]
+pub struct Contract;
+
+#[contractimpl]
+impl Contract {
+    // ----------------------------------------------------------------
+    // Init
+    // ----------------------------------------------------------------
+
+    pub fn init(env: Env, admin: Address) -> Result<(), ContractError> {
+        if storage::has_admin(&env) {
+            return Err(ContractError::AlreadyInitialized);
+        }
+        storage::set_admin(&env, &admin);
+        Ok(())
+    }
+
+    pub fn admin(env: Env) -> Address {
+        storage::get_admin(&env)
+    }
+
+    // ----------------------------------------------------------------
+    // Issue #400 — Multi-sig Admin Handover
+    // ----------------------------------------------------------------
+
+    /// Replace the admin set and threshold.
+    ///
+    /// `signers` must contain at least the current threshold of existing
+    /// admins so the handover itself is multi-sig protected.
+    pub fn set_admins(
+        env: Env,
+        signers: Vec<Address>, // current admins authorising this change
+        new_admins: Vec<Address>,
+        new_threshold: u32,
+    ) -> Result<(), ContractError> {
+        // Validate new config before touching state.
+        if new_threshold == 0 || new_threshold > new_admins.len() {
+            return Err(ContractError::InvalidThreshold);
+        }
+
+        // Require current multi-sig quorum.
+        storage::require_multisig(&env, &signers)?;
+
+        storage::set_admin_list_raw(&env, &new_admins, new_threshold);
+        Ok(())
+    }
+
+    /// Return the current admin list.
+    pub fn get_admins(env: Env) -> Vec<Address> {
+        storage::get_admin_list(&env)
+    }
+
+    /// Return the current approval threshold.
+    pub fn get_threshold(env: Env) -> u32 {
+        storage::get_threshold(&env)
+    }
+
+    // ----------------------------------------------------------------
+    // Issue #396 — Dust Threshold
+    // ----------------------------------------------------------------
+
+    /// Return the minimum stream amount for `asset` (default: 10 XLM).
+    pub fn get_min_value(env: Env, asset: Address) -> i128 {
+        storage::get_min_value(&env, &asset)
+    }
+
+    /// Override the minimum for a specific asset. Admin-only.
+    pub fn set_min_value(env: Env, asset: Address, min: i128) -> Result<(), ContractError> {
+        storage::get_admin(&env).require_auth();
+        storage::set_min_value(&env, &asset, min);
+        Ok(())
+    }
+
+    // ----------------------------------------------------------------
+    // Issue #359 — Migration Bridge
+    // ----------------------------------------------------------------
+
+    pub fn migrate_stream(
+        env: Env,
+        v1_contract: Address,
+        v1_stream_id: u64,
+        caller: Address,
+    ) -> Result<u64, ContractError> {
+        Self::require_not_paused(&env)?;
+        caller.require_auth();
+
+        let v1_client = V1Client::new(&env, &v1_contract);
+
+        let v1_stream = v1_client
+            .try_get_stream(&v1_stream_id)
+            .map_err(|_| ContractError::NotStreamOwner)?
+            .map_err(|_| ContractError::NotStreamOwner)?;
+
+        if v1_stream.receiver != caller {
+            return Err(ContractError::NotStreamOwner);
+        }
+
+        if v1_stream.cancelled || v1_stream.is_frozen || v1_stream.is_paused {
+            return Err(ContractError::StreamNotMigratable);
+        }
+
+        let now = env.ledger().timestamp();
+        if now >= v1_stream.end_time {
+            return Err(ContractError::StreamNotMigratable);
+        }
+
+        let elapsed = {
+            let effective_now = now.saturating_sub(v1_stream.total_paused_duration);
+            if effective_now <= v1_stream.start_time {
+                0i128
+            } else {
+                (effective_now - v1_stream.start_time) as i128
+            }
+        };
+        let duration = (v1_stream.end_time - v1_stream.start_time) as i128;
+        let unlocked = (v1_stream.total_amount * elapsed) / duration;
+        let remaining = v1_stream.total_amount - unlocked;
+
+        if remaining <= 0 {
+            return Err(ContractError::NothingToMigrate);
+        }
+
+        v1_client
+            .try_cancel(&v1_stream_id, &caller)
+            .map_err(|_| ContractError::StreamNotMigratable)?
+            .map_err(|_| ContractError::StreamNotMigratable)?;
+
+        let v2_stream_id = storage::next_stream_id(&env);
+
+        let v2_stream = StreamV2 {
+            sender: v1_stream.sender.clone(),
+            receiver: caller.clone(),
+            token: v1_stream.token.clone(),
+            total_amount: remaining,
+            start_time: now,
+            end_time: v1_stream.end_time,
+            withdrawn_amount: 0,
+            cancelled: false,
+            migrated_from_v1: true,
+            v1_stream_id,
+        };
+
+        storage::set_stream(&env, v2_stream_id, &v2_stream);
+        storage::update_stats(&env, remaining, &v1_stream.sender, &caller);
+
+        env.events().publish(
+            (symbol_short!("migrated"), caller.clone()),
+            StreamMigratedEvent {
+                v2_stream_id,
+                v1_stream_id,
+                caller: caller.clone(),
+                migrated_amount: remaining,
+                timestamp: now,
+            },
+        );
+
+        Ok(v2_stream_id)
+    }
+
+    pub fn get_stream(env: Env, stream_id: u64) -> Option<StreamV2> {
+        storage::get_stream(&env, stream_id)
+    }
+
+    pub fn get_v2_protocol_health(env: Env) -> types::ProtocolHealthV2 {
+        storage::get_health(&env)
+    }
+
+    // ----------------------------------------------------------------
+    // Issue #404 — Bulk TTL Extension
+    // ----------------------------------------------------------------
+
+    /// Extend persistent storage TTL for each stream ID in `ids`.
+    ///
+    /// Public and permissionless — anyone (altruistic keeper, incentivised
+    /// bot, or the stream participants themselves) can call this to prevent
+    /// active streams from expiring due to storage rent.
+    ///
+    /// Returns the number of streams whose TTL was actually extended
+    /// (IDs that no longer exist are silently skipped).
+    pub fn bump_active_streams_ttl(env: Env, ids: Vec<u64>) -> u32 {
+        storage::bump_streams_ttl(&env, &ids)
+    }
+
+    // ----------------------------------------------------------------
+    // Emergency Pause (Issue #364)
+    // ----------------------------------------------------------------
+
+    pub fn pause(env: Env) -> Result<(), ContractError> {
+        let admin = storage::get_admin(&env);
+        admin.require_auth();
+
+        storage::set_paused(&env, true);
+
+        env.events().publish(
+            (symbol_short!("pause"), admin.clone()),
+            ContractPausedEvent {
+                admin,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
+    pub fn unpause(env: Env) -> Result<(), ContractError> {
+        let admin = storage::get_admin(&env);
+        admin.require_auth();
+
+        storage::set_paused(&env, false);
+
+        env.events().publish(
+            (symbol_short!("unpause"), admin.clone()),
+            ContractUnpausedEvent {
+                admin,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        storage::is_paused(&env)
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), ContractError> {
+        if storage::is_paused(env) {
+            return Err(ContractError::ContractPaused);
+        }
+        Ok(())
+    }
+
+    // ----------------------------------------------------------------
+    // Issue #360 — Permit Streaming
+    // ----------------------------------------------------------------
+
+    pub fn create_stream_with_signature(
+        env: Env,
+        sender_pubkey: soroban_sdk::BytesN<32>,
+        receiver: Address,
+        token: Address,
+        total_amount: i128,
+        start_time: u64,
+        end_time: u64,
+        nonce: u64,
+        deadline: u64,
+        signature: soroban_sdk::BytesN<64>,
+    ) -> Result<u64, ContractError> {
+        Self::require_not_paused(&env)?;
+        let now = env.ledger().timestamp();
+
+        // ── Guard: deadline ──────────────────────────────────────────
+        if now > deadline {
+            return Err(ContractError::ExpiredDeadline);
+        }
+
+        // ── Guard: dust threshold ─────────────────────────────────────
+        if total_amount < storage::get_min_value(&env, &token) {
+            return Err(ContractError::BelowDustThreshold);
+        }
+
+        // ── Guard: nonce ─────────────────────────────────────────────
+        let nonce_key = (symbol_short!("NONCE"), sender_pubkey.clone());
+        let stored_nonce: u64 = env.storage().instance().get(&nonce_key).unwrap_or(0u64);
+
+        if nonce != stored_nonce {
+            return Err(ContractError::InvalidNonce);
+        }
+
+        // ── Build canonical message ───────────────────────────────────
+        let mut msg = soroban_sdk::Bytes::new(&env);
+        msg.extend_from_slice(b"STELLARSTREAM_PERMIT_V2");
+        msg.append(&env.current_contract_address().to_xdr(&env));
+        msg.append(&sender_pubkey.clone().into());
+        msg.append(&receiver.clone().to_xdr(&env));
+        msg.append(&token.clone().to_xdr(&env));
+
+        msg.extend_from_slice(&total_amount.to_be_bytes());
+        msg.extend_from_slice(&start_time.to_be_bytes());
+        msg.extend_from_slice(&end_time.to_be_bytes());
+        msg.extend_from_slice(&nonce.to_be_bytes());
+        msg.extend_from_slice(&deadline.to_be_bytes());
+
+        // ── Verify signature ─────────────────────────────────────────
+        // ed25519_verify panics on invalid signature
+        let msg_hash: soroban_sdk::BytesN<32> = env.crypto().sha256(&msg).into();
+        env.crypto()
+            .ed25519_verify(&sender_pubkey, &msg_hash.into(), &signature);
+
+        // ── Consume nonce ─────────────────────────────────────────────
+        env.storage()
+            .instance()
+            .set(&nonce_key, &(stored_nonce + 1));
+
+        // ── Pull tokens from sender ───────────────────────────────────
+        let token_client = soroban_sdk::token::TokenClient::new(&env, &token);
+        let sender_addr = Address::from_string_bytes(&sender_pubkey.clone().into());
+
+        token_client.transfer_from(
+            &env.current_contract_address(),
+            &sender_addr,
+            &env.current_contract_address(),
+            &total_amount,
+        );
+
+        // ── Create V2 stream ─────────────────────────────────────────
+        let stream_id = storage::next_stream_id(&env);
+
+        let stream = StreamV2 {
+            sender: sender_addr.clone(),
+            receiver: receiver.clone(),
+            token: token.clone(),
+            total_amount,
+            start_time,
+            end_time,
+            withdrawn_amount: 0,
+            cancelled: false,
+            migrated_from_v1: false,
+            v1_stream_id: 0,
+        };
+
+        storage::set_stream(&env, stream_id, &stream);
+        storage::update_stats(&env, total_amount, &sender_addr, &receiver);
+
+        // ── Emit event ────────────────────────────────────────────────
+        env.events().publish(
+            (symbol_short!("permit"), receiver.clone()),
+            PermitStreamCreatedEvent {
+                stream_id,
+                sender_pubkey: sender_pubkey.clone(),
+                receiver,
+                token,
+                total_amount,
+                nonce,
+                timestamp: now,
+            },
+        );
+
+        Ok(stream_id)
+    }
+}
+
+mod test;
